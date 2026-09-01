@@ -1,3 +1,5 @@
+# Roster-aware replacement and PORP (points over replacement per week).
+
 n_starters <- function(pos, settings) {
   flex_share <- list(QB = 0, RB = 0.45, WR = 0.45, TE = 0.10)
   bench_share <- list(QB = 0.15, RB = 0.40, WR = 0.35, TE = 0.10)
@@ -32,7 +34,9 @@ replacement_points <- function(scored, settings) {
       return(dplyr::tibble(pos = p, repl_pts = 0, repl_n = n))
     }
     idx <- min(n, nrow(pos_df))
-    dplyr::tibble(pos = p, repl_pts = pos_df$points[idx], repl_n = n)
+    repl <- pos_df$points[idx]
+    if (!is.finite(repl)) repl <- 0
+    dplyr::tibble(pos = p, repl_pts = repl, repl_n = n)
   })
 }
 
@@ -55,11 +59,13 @@ rank_players <- function(stats, settings, scoring, lambda = 0.35, weeks = 17) {
       ceiling_week = (ceiling_pts - repl_pts) / weeks
     )
   
-  max_porp <- max(out$porp_week, na.rm = TRUE)
+  max_porp <- suppressWarnings(max(out$porp_week, na.rm = TRUE))
+  if (!is.finite(max_porp) || max_porp <= 0) max_porp <- 1
+  
   out |>
     dplyr::mutate(
       adp_porp = adp_implied_porp(adp, max_porp),
-      value = (1 - lambda) * porp_week + lambda * adp_porp,
+      value = (1 - lambda) * tidyr::replace_na(porp_week, 0) + lambda * adp_porp,
       floor = floor_week,
       ceiling = ceiling_week
     ) |>

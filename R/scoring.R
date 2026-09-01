@@ -18,20 +18,25 @@ preset_scoring <- function(ppr_type = c("PPR", "Half PPR", "Standard")) {
   )
 }
 
+nz <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  ifelse(is.finite(x), x, 0)
+}
+
 score_players <- function(stats, scoring) {
   dplyr::mutate(
     stats,
     points =
-      pass_yds * scoring$pass_yd +
-      pass_td * scoring$pass_td +
-      pass_int * scoring$pass_int +
-      rush_yds * scoring$rush_yd +
-      rush_td * scoring$rush_td +
-      rec * scoring$rec +
-      rec_yds * scoring$rec_yd +
-      rec_td * scoring$rec_td +
-      fumbles * scoring$fumble,
-    floor_pts = points * floor_mult,
-    ceiling_pts = points * ceiling_mult
+      nz(pass_yds) * scoring$pass_yd +
+      nz(pass_td) * scoring$pass_td +
+      nz(pass_int) * scoring$pass_int +
+      nz(rush_yds) * scoring$rush_yd +
+      nz(rush_td) * scoring$rush_td +
+      nz(rec) * scoring$rec +
+      nz(rec_yds) * scoring$rec_yd +
+      nz(rec_td) * scoring$rec_td +
+      nz(fumbles) * scoring$fumble,
+    floor_pts = points * ifelse(is.finite(floor_mult) & floor_mult > 0, floor_mult, 0.8),
+    ceiling_pts = points * ifelse(is.finite(ceiling_mult) & ceiling_mult > 0, ceiling_mult, 1.1)
   )
 }
