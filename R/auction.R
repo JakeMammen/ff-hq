@@ -35,14 +35,22 @@ auction_dollars <- function(available, settings, keeper_spend = 0, n_keepers = 0
   pot <- max(league_cap - remaining_spots, 0)
   if (!is.finite(pot) || pot < 0) pot <- 0
   
-  value_w <- pmax(tidyr::replace_na(available$porp_week, 0), 0)
+  value_w <- if ("value" %in% names(available)) available$value else available$porp_week
+  floor_w <- if ("floor" %in% names(available)) available$floor else value_w
+  ceiling_w <- if ("ceiling" %in% names(available)) available$ceiling else value_w
+  
+  value_w <- pmax(tidyr::replace_na(as.numeric(value_w), 0), 0)
+  floor_w <- pmax(tidyr::replace_na(as.numeric(floor_w), 0), 0)
+  ceiling_w <- pmax(tidyr::replace_na(as.numeric(ceiling_w), 0), 0)
   value_w[!is.finite(value_w)] <- 0
+  floor_w[!is.finite(floor_w)] <- 0
+  ceiling_w[!is.finite(ceiling_w)] <- 0
   total_w <- sum(value_w, na.rm = TRUE)
   
   dplyr::mutate(
     available,
-    dollars = dollarize(porp_week, pot, total_w),
-    floor_dollars = dollarize(floor, pot, total_w),
-    ceiling_dollars = dollarize(ceiling, pot, total_w)
+    dollars = dollarize(value_w, pot, total_w),
+    floor_dollars = dollarize(floor_w, pot, total_w),
+    ceiling_dollars = dollarize(ceiling_w, pot, total_w)
   )
 }

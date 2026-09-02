@@ -5,23 +5,53 @@ library(readr)
 library(DT)
 library(tidyr)
 library(htmltools)
-
+library(jsonlite)
 source("R/scoring.R", local = TRUE)
 source("R/valuation.R", local = TRUE)
 source("R/auction.R", local = TRUE)
-
 norm_player <- function(x) {
   x <- tolower(as.character(x))
   x <- gsub("[^a-z0-9]+", " ", x)
   x <- gsub("\\b(jr|sr|ii|iii|iv|v)\\b", "", x)
   trimws(gsub("\\s+", " ", x))
 }
+fetch_ffc_adp <- function() {
+  formats <- list(adp_ppr = "ppr", adp_half = "half-ppr", adp_std = "standard")
+  pieces <- lapply(names(formats), function(col) {
+    url <- sprintf("https://fantasyfootballcalculator.com/api/v1/adp/%s?teams=12", formats[[col]])
+    raw <- tryCatch(jsonlite::fromJSON(url), error = function(e) NULL)
+    players <- if (!is.null(raw)) raw$players else NULL
+    if (is.null(players) || !is.data.frame(players) || !nrow(players)) {
+      return(tibble(player_norm = character(), pos = character()) |> mutate(!!col := numeric()))
+    }
+    tibble(
+      player_norm = norm_player(players$name),
+      pos = recode(
+        toupper(trimws(players$position)),
+        PK = "K", DEF = "DST", DST = "DST",
+        .default = toupper(trimws(players$position))
+      ),
+      !!col := suppressWarnings(as.numeric(players$adp))
+    ) |>
+      filter(pos %in% c("QB", "RB", "WR", "TE"), is.finite(.data[[col]])) |>
+      group_by(player_norm, pos) |>
+      summarise(!!col := mean(.data[[col]], na.rm = TRUE), .groups = "drop")
+  })
+  Reduce(function(x, y) full_join(x, y, by = c("player_norm", "pos")), pieces)
+}
+
+adp_has_values <- function(df) {
+  cols <- intersect(c("adp", "adp_ppr", "adp_half", "adp_std"), names(df))
+  if (!length(cols)) return(FALSE)
+  any(vapply(cols, function(nm) any(is.finite(suppressWarnings(as.numeric(df[[nm]])))), logical(1)))
+}
 
 proj <- read_csv("data/projections.csv", show_col_types = FALSE) |>
   mutate(
     player_norm = norm_player(player),
     pos = toupper(trimws(pos)),
-    team = toupper(trimws(as.character(team)))
+    team = toupper(trimws(as.character(team))),
+    across(any_of(c("adp", "adp_ppr", "adp_half", "adp_std")), ~ suppressWarnings(as.numeric(.x)))
   ) |>
   group_by(player_norm, pos) |>
   summarise(
@@ -32,23 +62,54 @@ proj <- read_csv("data/projections.csv", show_col_types = FALSE) |>
     },
     across(where(is.numeric), ~ mean(.x, na.rm = TRUE)),
     .groups = "drop"
+  )
+
+if (!adp_has_values(proj)) {
+  ffc_adp <- tryCatch(fetch_ffc_adp(), error = function(e) NULL)
+  if (!is.null(ffc_adp) && nrow(ffc_adp)) {
+    overlap <- intersect(c("adp_ppr", "adp_half", "adp_std"), names(proj))
+    if (length(overlap)) proj <- select(proj, -all_of(overlap))
+    proj <- left_join(proj, ffc_adp, by = c("player_norm", "pos"))
+  }
+}
+
+proj <- proj |>
+  mutate(
+    adp = dplyr::coalesce(
+      if ("adp" %in% names(proj)) suppressWarnings(as.numeric(adp)) else NA_real_,
+      if ("adp_ppr" %in% names(proj)) suppressWarnings(as.numeric(adp_ppr)) else NA_real_,
+      if ("adp_half" %in% names(proj)) suppressWarnings(as.numeric(adp_half)) else NA_real_,
+      if ("adp_std" %in% names(proj)) suppressWarnings(as.numeric(adp_std)) else NA_real_
+    )
   ) |>
   select(-player_norm)
 
 player_choices <- sort(unique(proj$player))
-
 adp_for_format <- function(stats, ppr_type) {
-  col <- switch(ppr_type,
-                "PPR" = "adp_ppr",
-                "Half PPR" = "adp_half",
-                "Standard" = "adp_std",
-                "adp"
+  preferred <- switch(
+    ppr_type,
+    "PPR" = c("adp_ppr", "adp", "adp_half", "adp_std"),
+    "Half PPR" = c("adp_half", "adp", "adp_ppr", "adp_std"),
+    "Standard" = c("adp_std", "adp", "adp_half", "adp_ppr"),
+    c("adp", "adp_ppr", "adp_half", "adp_std")
   )
   out <- stats
-  if (col %in% names(out)) out$adp <- out[[col]]
+  picked <- NULL
+  for (col in preferred) {
+    if (!col %in% names(out)) next
+    vals <- suppressWarnings(as.numeric(out[[col]]))
+    if (any(is.finite(vals))) {
+      picked <- vals
+      break
+    }
+  }
+  out$adp <- if (is.null(picked)) {
+    if ("adp" %in% names(out)) suppressWarnings(as.numeric(out$adp)) else NA_real_
+  } else {
+    picked
+  }
   out
 }
-
 player_cell <- function(player, status) {
   taken <- status %in% c("Drafted", "Keeper")
   checked <- if (identical(status, "Drafted")) "checked" else ""
@@ -60,7 +121,6 @@ player_cell <- function(player, status) {
     htmlEscape(player, attribute = TRUE), checked, disabled, label
   )
 }
-
 espn_abbr <- function(team) {
   abbr <- toupper(trimws(as.character(team)))
   abbr[is.na(abbr)] <- ""
@@ -82,7 +142,6 @@ espn_abbr <- function(team) {
     .default = abbr
   )
 }
-
 team_logo_cell <- function(team) {
   abbr <- espn_abbr(team)
   if (!nzchar(abbr) || abbr %in% c("FA", "NA", "NONE", "NULL")) return("")
@@ -92,7 +151,6 @@ team_logo_cell <- function(team) {
     url, htmlEscape(abbr), htmlEscape(abbr)
   )
 }
-
 draft_js <- JS(
   "table.on('change', 'input.draft-box', function() {",
   "  Shiny.setInputValue('draft_toggle', {",
@@ -102,11 +160,10 @@ draft_js <- JS(
   "  }, {priority: 'event'});",
   "});"
 )
-
 ui <- fluidPage(
   theme = bs_theme(
     version = 5,
-    base_font = font_google("Oswald"),
+    base_font = font_google("Oswald", wght = c(400, 500, 700)),
     heading_font = font_google("Silkscreen")
   ),
   tags$head(
@@ -153,90 +210,132 @@ ui <- fluidPage(
         line-height: 1.45;
         color: #334155;
       }
+      .legend-box b, .legend-box strong {
+        font-weight: 700 !important;
+        color: #0f172a;
+      }
       .compact-row .form-group { margin-bottom: 6px; }
+      .dataTables_filter {
+        float: left !important;
+        text-align: left;
+        margin: 0 0 10px 0;
+      }
+      .dataTables_filter input {
+        margin-left: 8px;
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        padding: 4px 8px;
+      }
+      .settings-section-title {
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: #1f3a60;
+        margin: 4px 0 8px 0;
+        padding-bottom: 4px;
+        border-bottom: 1px solid #e2e8f0;
+      }
+      .settings-details {
+        border: 1px solid #e2e8f0;
+        border-radius: 10px;
+        padding: 8px 10px 4px 10px;
+        margin: 10px 0 12px 0;
+        background: #f8fafc;
+      }
+      .settings-details > summary {
+        cursor: pointer;
+        font-weight: 700;
+        text-transform: uppercase;
+        font-size: 13px;
+        letter-spacing: 0.04em;
+        color: #1f3a60;
+        list-style: none;
+        padding: 4px 0 8px 0;
+      }
+      .settings-details > summary::-webkit-details-marker { display: none; }
+      .settings-details > summary::after {
+        content: \" +\";
+        float: right;
+        color: #64748b;
+        font-weight: 700;
+      }
+      .settings-details[open] > summary::after {
+        content: \" \\2212\";
+      }
     "))
   ),
   div(
     class = "title-header-banner",
-    tags$h2("Fantasy Sports Pack Player HQ"),
-    tags$p(class = "byline", "By @FantasySPack")
+    tags$h1("Fantasy Sports Pack 2026 Draft Board HQ"),
+    tags$h6("By @FantasySPack"),
+    tags$p(class = "byline", "Wisdom-of-the-crowd projections using {ffanalytics}")
   ),
   tabsetPanel(
     id = "main_tabs",
     tabPanel(
-      "Rankings",
+      "Custom Settings",
       br(),
       sidebarLayout(
         sidebarPanel(
           class = "sidebar-panel-styled",
           width = 3,
-          p(class = "crowd-note", "Wisdom-of-the-crowd projections using {ffanalytics}"),
-          tabsetPanel(
-            id = "side_tabs",
-            type = "pills",
-            tabPanel(
-              "League",
-              br(),
-              selectInput("league_format", "Format", c("Redraft" = "redraft", "Dynasty auction" = "auction"), "redraft"),
-              sliderInput("teams", "# Teams", min = 8, max = 14, value = 12, step = 1),
-              selectInput("qb_type", "QB / Superflex", c("1 QB", "Superflex")),
-              fluidRow(class = "compact-row",
-                       column(6, numericInput("rb", "RB", 2, min = 1, max = 4, step = 1)),
-                       column(6, numericInput("wr", "WR", 2, min = 1, max = 5, step = 1))
-              ),
-              fluidRow(class = "compact-row",
-                       column(6, numericInput("te", "TE", 1, min = 0, max = 3, step = 1)),
-                       column(6, numericInput("flex", "FLEX", 1, min = 0, max = 3, step = 1))
-              ),
-              numericInput("bench", "Bench", 5, min = 0, max = 10, step = 1),
-              sliderInput("lambda", "ADP blend", min = 0, max = 1, value = 0.35, step = 0.05),
-              conditionalPanel(
-                condition = "input.league_format == 'auction'",
-                numericInput("budget", "Cap $", 200, min = 50, max = 1000, step = 5),
-                checkboxInput("keepers_on", "Use keepers", TRUE),
-                conditionalPanel(
-                  condition = "input.keepers_on == true",
-                  selectizeInput("keeper_player", "Keeper", choices = player_choices, selected = NULL),
-                  numericInput("keeper_salary", "Salary", 20, min = 1, max = 200, step = 1),
-                  actionButton("add_keeper", "Add", class = "btn-success btn-sm"),
-                  actionButton("remove_keeper", "Remove", class = "btn-sm")
-                )
-              )
-            ),
-            tabPanel(
-              "Scoring",
-              br(),
-              selectInput("ppr_type", "Preset", c("PPR", "Half PPR", "Standard", "Custom"), "PPR"),
-              fluidRow(class = "compact-row",
-                       column(6, numericInput("pass_yd", "Pass yd", 0.04, step = 0.01)),
-                       column(6, numericInput("pass_td", "Pass TD", 4, step = 0.5))
-              ),
-              fluidRow(class = "compact-row",
-                       column(6, numericInput("pass_int", "INT", -2, step = 0.5)),
-                       column(6, numericInput("fumble", "Fum", -2, step = 0.5))
-              ),
-              fluidRow(class = "compact-row",
-                       column(6, numericInput("rush_yd", "Rush yd", 0.1, step = 0.01)),
-                       column(6, numericInput("rush_td", "Rush TD", 6, step = 0.5))
-              ),
-              fluidRow(class = "compact-row",
-                       column(6, numericInput("rec", "Rec", 1, step = 0.1)),
-                       column(6, numericInput("rec_yd", "Rec yd", 0.1, step = 0.01))
-              ),
-              numericInput("rec_td", "Rec TD", 6, step = 0.5)
-            ),
-            tabPanel(
-              "Board",
-              br(),
-              selectInput("pos_filter", "Position", c("All", "QB", "RB", "WR", "TE")),
-              checkboxInput("hide_taken", "Hide drafted / keepers", FALSE),
-              actionButton("clear_drafted", "Clear drafted", class = "btn-sm"),
-              br(), br(),
-              downloadButton("download", "Download rankings"),
-              br(), br(),
-              downloadButton("download_snapshot", "Download league snapshot")
+          tags$p(class = "settings-section-title", "League"),
+          selectInput("league_format", "Format", c("Redraft" = "redraft", "Dynasty auction" = "auction"), "redraft"),
+          sliderInput("teams", "# Teams", min = 8, max = 14, value = 12, step = 1),
+          selectInput("qb_type", "QB / Superflex", c("1 QB", "Superflex")),
+          fluidRow(class = "compact-row",
+                   column(6, numericInput("rb", "RB", 2, min = 1, max = 4, step = 1)),
+                   column(6, numericInput("wr", "WR", 2, min = 1, max = 5, step = 1))
+          ),
+          fluidRow(class = "compact-row",
+                   column(6, numericInput("te", "TE", 1, min = 0, max = 3, step = 1)),
+                   column(6, numericInput("flex", "FLEX", 1, min = 0, max = 3, step = 1))
+          ),
+          numericInput("bench", "Bench", 5, min = 0, max = 10, step = 1),
+          sliderInput("lambda", "ADP blend", min = 0, max = 1, value = 0.35, step = 0.05),
+          conditionalPanel(
+            condition = "input.league_format == 'auction'",
+            numericInput("budget", "Cap $", 200, min = 50, max = 1000, step = 5),
+            checkboxInput("keepers_on", "Use keepers", TRUE),
+            conditionalPanel(
+              condition = "input.keepers_on == true",
+              selectizeInput("keeper_player", "Keeper", choices = player_choices, selected = NULL),
+              numericInput("keeper_salary", "Salary", 20, min = 1, max = 200, step = 1),
+              actionButton("add_keeper", "Add", class = "btn-success btn-sm"),
+              actionButton("remove_keeper", "Remove", class = "btn-sm")
             )
-          )
+          ),
+          tags$details(
+            class = "settings-details",
+            tags$summary("Scoring"),
+            selectInput("ppr_type", "Preset", c("PPR", "Half PPR", "Standard", "Custom"), "PPR"),
+            fluidRow(class = "compact-row",
+                     column(6, numericInput("pass_yd", "Pass yd", 0.04, step = 0.01)),
+                     column(6, numericInput("pass_td", "Pass TD", 4, step = 0.5))
+            ),
+            fluidRow(class = "compact-row",
+                     column(6, numericInput("pass_int", "INT", -2, step = 0.5)),
+                     column(6, numericInput("fumble", "Fum", -2, step = 0.5))
+            ),
+            fluidRow(class = "compact-row",
+                     column(6, numericInput("rush_yd", "Rush yd", 0.1, step = 0.01)),
+                     column(6, numericInput("rush_td", "Rush TD", 6, step = 0.5))
+            ),
+            fluidRow(class = "compact-row",
+                     column(6, numericInput("rec", "Rec", 1, step = 0.1)),
+                     column(6, numericInput("rec_yd", "Rec yd", 0.1, step = 0.01))
+            ),
+            numericInput("rec_td", "Rec TD", 6, step = 0.5)
+          ),
+          tags$p(class = "settings-section-title", "Board"),
+          selectInput("pos_filter", "Position", c("All", "QB", "RB", "WR", "TE")),
+          checkboxInput("hide_taken", "Hide drafted / keepers", FALSE),
+          actionButton("clear_drafted", "Clear drafted", class = "btn-sm"),
+          br(), br(),
+          downloadButton("download", "Download rankings"),
+          br(), br(),
+          downloadButton("download_snapshot", "Download league snapshot")
         ),
         mainPanel(
           width = 9,
@@ -244,11 +343,11 @@ ui <- fluidPage(
           div(
             class = "legend-box",
             HTML(paste(
-              "<strong>Value</strong> = weekly points over replacement, blended with format-specific FFC ADP.",
+              "<b>Value</b> = weekly points over replacement on a 50/50 mix of the raw PORP curve and a locally smoothed PORP curve, then blended with format-specific FFC ADP.",
               "Replacement uses your roster (starters + FLEX share + a bench pad).",
-              "<strong>Floor / Ceiling</strong> = source disagreement around that projection.",
-              "In <strong>Dynasty auction</strong>, those three columns become dollars: $1 per remaining roster spot, leftover cap split by surplus.",
-              "<strong>ADP</strong> switches with PPR / Half / Standard.",
+              "<b>Floor / Ceiling</b> = source-scenario range around that same blended curve.",
+              "In <b>Dynasty auction</b>, those three columns become dollars: $1 per remaining roster spot, leftover cap split by each scenario's positive PORP share.",
+              "<b>ADP</b> switches with PPR / Half / Standard.",
               "Check a name to mark drafted."
             ))
           ),
@@ -271,6 +370,8 @@ ui <- fluidPage(
             class = "sidebar-panel-styled",
             h4("League snapshot"),
             tableOutput("league_snapshot"),
+            h4("Players by position"),
+            tableOutput("position_counts"),
             downloadButton("download_snapshot2", "Download league snapshot"),
             conditionalPanel(
               condition = "input.league_format == 'auction'",
@@ -287,9 +388,10 @@ ui <- fluidPage(
             tags$ul(
               tags$li("Crowd stats: ESPN, CBS, FantasyPros."),
               tags$li("ADP: Fantasy Football Calculator lists for PPR, Half PPR, and Standard."),
-              tags$li("Points use the Scoring tab multipliers."),
-              tags$li("Value is weekly PORP, then optionally blended with ADP."),
-              tags$li("Auction $ = $1 floor + share of leftover cap.")
+              tags$li("Points use the Scoring multipliers."),
+              tags$li("PORP uses roster-aware replacement, then a 50/50 raw and locally smoothed curve."),
+              tags$li("Value / Floor / Ceiling apply that curve to the central projection and source scenarios, then ADP."),
+              tags$li("Auction $ = $1 + leftover cap split by positive PORP share.")
             )
           )
         )
@@ -302,9 +404,26 @@ ui <- fluidPage(
     )
   )
 )
-
 server <- function(input, output, session) {
-  keepers <- reactiveVal(tibble(player = character(), salary = numeric()))
+  empty_keepers <- function() {
+    tibble(player = character(), pos = character(), team = character(), salary = numeric())
+  }
+  keepers <- reactiveVal(empty_keepers())
+  player_meta <- function(name) {
+    hit <- proj[proj$player == name, c("pos", "team"), drop = FALSE]
+    if (!nrow(hit)) return(list(pos = NA_character_, team = NA_character_))
+    list(pos = as.character(hit$pos[[1]]), team = as.character(hit$team[[1]]))
+  }
+  keeper_view <- function(df) {
+    if (is.null(df) || nrow(df) == 0) return(empty_keepers())
+    if (!all(c("pos", "team") %in% names(df))) {
+      lookup <- proj |>
+        dplyr::select(player, pos, team) |>
+        dplyr::distinct(player, .keep_all = TRUE)
+      df <- df |> dplyr::left_join(lookup, by = "player")
+    }
+    df |> dplyr::select(player, pos, team, salary)
+  }
   drafted <- reactiveVal(character(0))
   is_auction <- reactive(identical(input$league_format, "auction"))
   use_keepers <- reactive(is_auction() && isTRUE(input$keepers_on))
@@ -335,8 +454,22 @@ server <- function(input, output, session) {
     cur <- keepers()
     if (input$keeper_player %in% cur$player) {
       cur$salary[cur$player == input$keeper_player] <- input$keeper_salary
+      if ("pos" %in% names(cur)) {
+        meta <- player_meta(input$keeper_player)
+        cur$pos[cur$player == input$keeper_player] <- meta$pos
+        cur$team[cur$player == input$keeper_player] <- meta$team
+      }
     } else {
-      cur <- bind_rows(cur, tibble(player = input$keeper_player, salary = input$keeper_salary))
+      meta <- player_meta(input$keeper_player)
+      cur <- bind_rows(
+        keeper_view(cur),
+        tibble(
+          player = input$keeper_player,
+          pos = meta$pos,
+          team = meta$team,
+          salary = input$keeper_salary
+        )
+      )
     }
     keepers(cur)
     drafted(setdiff(drafted(), input$keeper_player))
@@ -376,7 +509,7 @@ server <- function(input, output, session) {
   })
   
   active_keepers <- reactive({
-    if (use_keepers()) keepers() else tibble(player = character(), salary = numeric())
+    if (use_keepers()) keeper_view(keepers()) else empty_keepers()
   })
   
   taken_players <- reactive(unique(c(active_keepers()$player, drafted())))
@@ -384,16 +517,17 @@ server <- function(input, output, session) {
   ranked <- reactive({
     board <- rank_players(adp_for_format(proj, input$ppr_type), settings(), scoring(), lambda = input$lambda)
     kept <- active_keepers()
-    available <- board |> filter(!(player %in% taken_players()))
     if (is_auction()) {
-      available <- auction_dollars(available, settings(), sum(kept$salary, na.rm = TRUE), nrow(kept))
+      priced <- board |> filter(!(player %in% kept$player))
+      priced <- auction_dollars(priced, settings(), sum(kept$salary, na.rm = TRUE), nrow(kept))
+      keepers_board <- board |>
+        filter(player %in% kept$player) |>
+        mutate(dollars = NA_real_, floor_dollars = NA_real_, ceiling_dollars = NA_real_)
+      board <- bind_rows(priced, keepers_board)
     } else {
-      available <- mutate(available, dollars = NA_real_, floor_dollars = NA_real_, ceiling_dollars = NA_real_)
+      board <- mutate(board, dollars = NA_real_, floor_dollars = NA_real_, ceiling_dollars = NA_real_)
     }
-    taken <- board |>
-      filter(player %in% taken_players()) |>
-      mutate(dollars = NA_real_, floor_dollars = NA_real_, ceiling_dollars = NA_real_)
-    bind_rows(available, taken) |>
+    board |>
       mutate(
         status = case_when(
           player %in% kept$player ~ "Keeper",
@@ -424,18 +558,26 @@ server <- function(input, output, session) {
         sprintf("%.2f", input$lambda), sprintf("%.2f", input$rec)
       )
     )
+    pos_counts <- position_counts_df()
+    snap <- bind_rows(
+      snap,
+      tibble(
+        Item = paste(pos_counts$Position, "rostered"),
+        Value = as.character(pos_counts$Players)
+      )
+    )
     if (is_auction()) {
       kept <- active_keepers()
       snap <- bind_rows(
         snap,
         tibble(
-          Item = c("Team cap", "League cap", "Keepers", "Keeper salaries", "Remaining league cap"),
+          Item = c("Team Cap", "League Cap", "Keepers", "Keeper Salaries", "Remaining Team Cap"),
           Value = c(
             paste0("$", input$budget),
-            paste0("$", input$teams * input$budget),
+            paste0("$", input$budget),
             as.character(nrow(kept)),
             paste0("$", sum(kept$salary, na.rm = TRUE)),
-            paste0("$", input$teams * input$budget - sum(kept$salary, na.rm = TRUE))
+            paste0("$", input$budget - sum(kept$salary, na.rm = TRUE))
           )
         )
       )
@@ -456,9 +598,10 @@ server <- function(input, output, session) {
   
   output$keeper_table <- renderDT({
     datatable(
-      if (!use_keepers() || nrow(keepers()) == 0) tibble(player = character(), salary = numeric()) else keepers(),
+      keeper_view(if (!use_keepers()) empty_keepers() else keepers()),
       selection = "multiple",
       rownames = FALSE,
+      colnames = c("Player", "Pos", "Team", "Salary"),
       options = list(dom = "t", paging = FALSE, info = FALSE)
     )
   })
@@ -488,14 +631,15 @@ server <- function(input, output, session) {
       rownames = FALSE,
       escape = FALSE,
       selection = "none",
-      filter = "top",
+      filter = "none",
       callback = draft_js,
       options = list(
         paging = FALSE,
         info = FALSE,
         lengthChange = FALSE,
-        searching = FALSE,
-        dom = "t",
+        searching = TRUE,
+        ordering = TRUE,
+        dom = "ft",
         scrollX = TRUE,
         rowCallback = JS(
           "function(row, data) {",
@@ -535,25 +679,41 @@ server <- function(input, output, session) {
     content = function(file) write_csv(league_snapshot_df(), file)
   )
   
+  position_counts_df <- reactive({
+    owned <- taken_players()
+    counts <- proj |>
+      filter(player %in% owned) |>
+      count(pos, name = "Players")
+    tibble(Position = c("QB", "RB", "WR", "TE")) |>
+      left_join(counts, by = c("Position" = "pos")) |>
+      mutate(Players = as.integer(tidyr::replace_na(Players, 0)))
+  })
+  
   output$league_snapshot <- renderTable(league_snapshot_df())
+  output$position_counts <- renderTable(position_counts_df())
   
   output$auction_snapshot <- renderTable({
     req(is_auction())
     kept <- active_keepers()
     tibble(
-      Item = c("Team cap", "League cap", "Keepers", "Keeper salaries", "Remaining league cap"),
+      Item = c("Team Cap", "League Cap", "Keepers", "Keeper Salaries", "Remaining Team Cap"),
       Value = c(
         paste0("$", input$budget),
-        paste0("$", input$teams * input$budget),
+        paste0("$", input$budget),
         nrow(kept),
         paste0("$", sum(kept$salary, na.rm = TRUE)),
-        paste0("$", input$teams * input$budget - sum(kept$salary, na.rm = TRUE))
+        paste0("$", input$budget - sum(kept$salary, na.rm = TRUE))
       )
     )
   })
   
   output$league_keepers <- renderDT({
-    datatable(active_keepers(), rownames = FALSE, options = list(paging = FALSE, info = FALSE, dom = "t"))
+    datatable(
+      active_keepers(),
+      rownames = FALSE,
+      colnames = c("Player", "Pos", "Team", "Salary"),
+      options = list(paging = FALSE, info = FALSE, dom = "t")
+    )
   })
   
   output$league_drafted <- renderDT({
@@ -564,5 +724,4 @@ server <- function(input, output, session) {
     )
   })
 }
-
 shinyApp(ui, server)

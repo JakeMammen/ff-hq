@@ -2339,25 +2339,25 @@
   },
   "files": {
     "app.R": {
-      "checksum": "143a3648f075145481d9b81389b31aee"
+      "checksum": "966063b651c6170c06803dfd9d44159c"
     },
     "data/projections_by_source.csv": {
-      "checksum": "d064f5456df9b1063f265db16dd59586"
+      "checksum": "96bdc90d52488fa234cbe8f93149c40b"
     },
     "data/projections.csv": {
-      "checksum": "dfe9c50d5c9d503785e5ba41cb0fb3f7"
+      "checksum": "05ff843cd48d67647cdf342585784622"
     },
     "data/refresh_meta.txt": {
-      "checksum": "8b3fd54e63dfc4b60554f51666e470a7"
+      "checksum": "ef96b2efdd54aae07b8fba85d9706281"
     },
     "R/auction.R": {
-      "checksum": "6ef938dbfa70a87564d37cdb12cf94a7"
+      "checksum": "aea8004218f9fbcda90b1ae440093eb1"
     },
     "R/scoring.R": {
       "checksum": "e7141ffffe6410c7c43897c1f4b869f0"
     },
     "R/valuation.R": {
-      "checksum": "1195685cca1846902b1ce18a2355aa0b"
+      "checksum": "9c8cdf6de0bafa0d4dfdc90508f6ff97"
     },
     "scripts/refresh_adp.R": {
       "checksum": "18d41927d3b9f28613b5e65e351fca3d"
